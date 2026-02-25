@@ -1,3 +1,44 @@
+# [2.2.0](https://github.com/5-stones/keycloak-email-otp/compare/v2.1.1...v2.2.0) (2026-01-22)
+
+
+### Bug Fixes
+
+* **messages_en:** add proper single quote escaping ([656a1ce](https://github.com/5-stones/keycloak-email-otp/commit/656a1ce726526fbdc3250d6ce9a4f0c2e2c3b5b9))
+
+
+### Features
+
+* enhance OTP email functionality by adding "resend email" capability ([#22](https://github.com/5-stones/keycloak-email-otp/issues/22)) ([84b8674](https://github.com/5-stones/keycloak-email-otp/commit/84b86744c9cf42d2f9ce47132cab09ca99f5b2e2))
+
+
+
+## [2.1.1](https://github.com/5-stones/keycloak-email-otp/compare/v2.1.0...v2.1.1) (2025-07-04)
+
+
+### Bug Fixes
+
+* **translations:** remove erroneous s in emailTOTPBody ([ed434db](https://github.com/5-stones/keycloak-email-otp/commit/ed434db5bba33c898f90237a7bd4506dab7d6aa7))
+
+
+
+# [2.1.0](https://github.com/5-stones/keycloak-email-otp/compare/v2.0.1...v2.1.0) (2024-11-26)
+
+
+### Features
+
+* automatically set email as verified when successful ([19129a2](https://github.com/5-stones/keycloak-email-otp/commit/19129a298c197d0a4079a5f695d6ef703b619b1c))
+
+
+
+## [2.0.1](https://github.com/5-stones/keycloak-email-otp/compare/v2.0.0...v2.0.1) (2024-11-26)
+
+
+### Bug Fixes
+
+* fix retry counting when set to Required and display of remaining attempts ([6361f64](https://github.com/5-stones/keycloak-email-otp/commit/6361f641f0fdb8dbfa157894682612d82d03a0a3))
+
+
+
 # [2.0.0](https://github.com/5-stones/keycloak-email-otp/compare/v1.0.0...v2.0.0) (2023-11-02)
 
 
