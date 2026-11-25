@@ -2,6 +2,7 @@ package com.weare5stones.keycloak.authenticators.emailotp;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
+import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
 import java.util.HashMap;
 import java.util.List;
@@ -12,6 +13,7 @@ import org.jboss.logging.Logger;
 import org.keycloak.authentication.AuthenticationFlowContext;
 import org.keycloak.authentication.AuthenticationFlowError;
 import org.keycloak.authentication.Authenticator;
+import org.keycloak.authentication.authenticators.util.AuthenticatorUtils;
 import org.keycloak.common.util.SecretGenerator;
 import org.keycloak.email.EmailException;
 import org.keycloak.email.EmailTemplateProvider;
@@ -20,6 +22,7 @@ import org.keycloak.models.AuthenticatorConfigModel;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserModel;
+import org.keycloak.services.messages.Messages;
 import org.keycloak.sessions.AuthenticationSessionModel;
 import org.keycloak.utils.StringUtil;
 
@@ -29,7 +32,6 @@ public class EmailOTPAuthenticator implements Authenticator {
   private static final String TOTP_EMAIL = "totp-email.ftl";
   private static final String AUTH_NOTE_CODE = "code";
   private static final String AUTH_NOTE_TTL = "ttl";
-  private static final String AUTH_NOTE_EMAIL_SENT = "emailSent";
   private static final String AUTH_NOTE_REMAINING_RETRIES = "remainingRetries";
   private static final String AUTH_NOTE_REMAINING_RESEND_RETRIES = "remainingResendRetries";
   private static final Logger logger = Logger.getLogger(EmailOTPAuthenticator.class);
@@ -40,64 +42,44 @@ public class EmailOTPAuthenticator implements Authenticator {
 
   @Override
   public void authenticate(AuthenticationFlowContext context) {
-    try {
-      boolean isSent = Boolean.parseBoolean(Optional.ofNullable(context.getAuthenticationSession().getAuthNote(AUTH_NOTE_EMAIL_SENT)).orElse("false"));
-      if(!isSent) {
-        sendEmailForOTP(context, false);
-        context.getAuthenticationSession().setAuthNote(AUTH_NOTE_EMAIL_SENT, "true");
+    AuthenticationSessionModel authSession = context.getAuthenticationSession();
+    if (authSession.getAuthNote(AUTH_NOTE_REMAINING_RETRIES) == null) {
+      AuthenticatorConfigModel config = context.getAuthenticatorConfig();
+      try {
+        sendEmailForOTP(context);
+      } catch (Exception e) {
+        failEmailNotSent(context, e);
+        return;
       }
-      context.challenge(challengeForm(context).createForm(TOTP_FORM));
-    } catch (Exception e) {
-      logger.error("An error occurred when attempting to email an TOTP auth:", e);
-      context.failureChallenge(AuthenticationFlowError.INTERNAL_ERROR,
-          context.form().setError("emailTOTPEmailNotSent", e.getMessage())
-              .createErrorPage(Response.Status.INTERNAL_SERVER_ERROR));
+      authSession.setAuthNote(AUTH_NOTE_REMAINING_RETRIES, Integer.toString(getMaxRetries(config)));
+      authSession.setAuthNote(AUTH_NOTE_REMAINING_RESEND_RETRIES, Integer.toString(getMaxResendRetries(config)));
     }
+    context.challenge(challengeForm(context).createForm(TOTP_FORM));
   }
 
   @Override
   public void action(AuthenticationFlowContext context) {
-
     AuthenticationSessionModel authSession = context.getAuthenticationSession();
-    AuthenticatorConfigModel config = context.getAuthenticatorConfig();
+    int remainingAttempts = readIntNote(authSession, AUTH_NOTE_REMAINING_RETRIES);
 
-    String resendEmail = context.getHttpRequest().getDecodedFormParameters().getFirst("resend");
-    if(!Strings.isNullOrEmpty(resendEmail) && "resend".equals(resendEmail)) {
-      try {
-
-        String remainingResendRetiresStr = authSession.getAuthNote(AUTH_NOTE_REMAINING_RESEND_RETRIES);
-        int remainingResendAttempts = remainingResendRetiresStr == null ? getMaxResendRetries(config) + 1 : Integer.parseInt(remainingResendRetiresStr);
-
-        if(remainingResendAttempts <= 0) {
-          context.failureChallenge(
-            AuthenticationFlowError.INVALID_CREDENTIALS,
-            challengeForm(context)
-              .setError("emailTOTPResendRetriesLimitReached")
-              .createForm(TOTP_FORM)
-          );
-          return;
-        }
-
-        sendEmailForOTP(context, true);
-        authSession.setAuthNote(AUTH_NOTE_REMAINING_RESEND_RETRIES, Integer.toString(remainingResendAttempts-1));
-        context.challenge(challengeForm(context)
-            .setInfo("otpMailSentAgain")
-          .createForm(TOTP_FORM));
-      } catch (Exception e) {
-        logger.error("An error occurred when attempting to email an TOTP auth:", e);
-        context.failureChallenge(AuthenticationFlowError.INTERNAL_ERROR,
-          context.form().setError("emailTOTPEmailNotSent", e.getMessage())
-            .createErrorPage(Response.Status.INTERNAL_SERVER_ERROR));
-      }
+    if (remainingAttempts <= 0) {
+      challengeWithError(context, "emailTOTPCodeInvalidLocked");
       return;
     }
 
-    String enteredCode = context.getHttpRequest().getDecodedFormParameters().getFirst("code");
+    if (AuthenticatorUtils.getDisabledByBruteForceEventError(context, context.getUser()) != null) {
+      challengeWithError(context, Messages.ACCOUNT_TEMPORARILY_DISABLED);
+      return;
+    }
+
+    MultivaluedMap<String, String> formData = context.getHttpRequest().getDecodedFormParameters();
+    if ("resend".equals(formData.getFirst("resend"))) {
+      resendCode(context);
+      return;
+    }
 
     String code = authSession.getAuthNote(AUTH_NOTE_CODE);
     String ttl = authSession.getAuthNote(AUTH_NOTE_TTL);
-    String remainingAttemptsStr = authSession.getAuthNote(AUTH_NOTE_REMAINING_RETRIES);
-    int remainingAttempts = remainingAttemptsStr == null ? 0 : Integer.parseInt(remainingAttemptsStr);
 
     if (code == null || ttl == null) {
       context.failureChallenge(AuthenticationFlowError.INTERNAL_ERROR,
@@ -105,34 +87,60 @@ public class EmailOTPAuthenticator implements Authenticator {
       return;
     }
 
-    boolean isValid = enteredCode.equals(code);
-    if (isValid) {
-      if (Long.parseLong(ttl) < System.currentTimeMillis()) {
-        // expired
-        context.failureChallenge(AuthenticationFlowError.EXPIRED_CODE,
-            context.form().setError("emailTOTPCodeExpired").createErrorPage(Response.Status.BAD_REQUEST));
-      } else {
-        // valid
-        if (!context.getUser().isEmailVerified()) {
-          context.getUser().setEmailVerified(true);
-        }
-        context.success();
-      }
-    } else {
-      // Code is invalid
-      if (remainingAttempts > 0) {
-        authSession.setAuthNote(AUTH_NOTE_REMAINING_RETRIES, Integer.toString(remainingAttempts - 1));
-
-        // Inform user of the remaining attempts
-        context.failureChallenge(
-            AuthenticationFlowError.INVALID_CREDENTIALS,
-            challengeForm(context)
-                .setError("emailTOTPCodeInvalid", Integer.toString(remainingAttempts))
-                .createForm(TOTP_FORM));
-      } else {
-        context.failure(AuthenticationFlowError.INVALID_CREDENTIALS);
-      }
+    if (Long.parseLong(ttl) < System.currentTimeMillis()) {
+      challengeWithError(context, "emailTOTPCodeExpired");
+      return;
     }
+
+    if (code.equals(formData.getFirst("code"))) {
+      if (!context.getUser().isEmailVerified()) {
+        context.getUser().setEmailVerified(true);
+      }
+      context.success();
+      return;
+    }
+
+    remainingAttempts--;
+    authSession.setAuthNote(AUTH_NOTE_REMAINING_RETRIES, Integer.toString(remainingAttempts));
+    LoginFormsProvider form = remainingAttempts > 0
+        ? challengeForm(context).setError("emailTOTPCodeInvalid", Integer.toString(remainingAttempts))
+        : challengeForm(context).setError("emailTOTPCodeInvalidLocked");
+    context.failureChallenge(AuthenticationFlowError.INVALID_CREDENTIALS, form.createForm(TOTP_FORM));
+  }
+
+  private void resendCode(AuthenticationFlowContext context) {
+    AuthenticationSessionModel authSession = context.getAuthenticationSession();
+    int remainingResends = readIntNote(authSession, AUTH_NOTE_REMAINING_RESEND_RETRIES);
+
+    if (remainingResends <= 0) {
+      challengeWithError(context, "emailTOTPResendRetriesLimitReached");
+      return;
+    }
+
+    try {
+      sendEmailForOTP(context);
+    } catch (Exception e) {
+      failEmailNotSent(context, e);
+      return;
+    }
+    authSession.setAuthNote(AUTH_NOTE_REMAINING_RESEND_RETRIES, Integer.toString(remainingResends - 1));
+    context.challenge(challengeForm(context).setInfo("otpMailSentAgain").createForm(TOTP_FORM));
+  }
+
+  private void challengeWithError(AuthenticationFlowContext context, String message) {
+    context.challenge(challengeForm(context).setError(message).createForm(TOTP_FORM));
+  }
+
+  private void failEmailNotSent(AuthenticationFlowContext context, Exception e) {
+    logger.error("An error occurred when attempting to email an TOTP auth:", e);
+    context.failureChallenge(AuthenticationFlowError.INTERNAL_ERROR,
+        context.form().setError("emailTOTPEmailNotSent", e.getMessage())
+            .createErrorPage(Response.Status.INTERNAL_SERVER_ERROR));
+  }
+
+  private int readIntNote(AuthenticationSessionModel authSession, String note) {
+    String value = authSession.getAuthNote(note);
+    return value == null ? 0 : Integer.parseInt(value);
   }
 
   @Override
@@ -251,7 +259,7 @@ public class EmailOTPAuthenticator implements Authenticator {
         .randomString(length, symbols);
   }
 
-  private void sendEmailForOTP(AuthenticationFlowContext context, Boolean shouldUseExistingCode) throws EmailException {
+  private void sendEmailForOTP(AuthenticationFlowContext context) throws EmailException {
     AuthenticatorConfigModel config = context.getAuthenticatorConfig();
     KeycloakSession session = context.getSession();
     UserModel user = context.getUser();
@@ -265,16 +273,9 @@ public class EmailOTPAuthenticator implements Authenticator {
         .getOrDefault(
           EmailOTPAuthenticatorFactory.CONFIG_PROP_SIMULATION,
           "false"));
-    String code = null;
-    if(shouldUseExistingCode) {
-      code = authSession.getAuthNote(AUTH_NOTE_CODE);
-    } else {
-      code = getCode(config);
-      authSession.setAuthNote(AUTH_NOTE_CODE, code);
-      int maxRetries = getMaxRetries(config);
-      authSession.setAuthNote(AUTH_NOTE_TTL, Long.toString(System.currentTimeMillis() + (ttl * 1000L)));
-      authSession.setAuthNote(AUTH_NOTE_REMAINING_RETRIES, Integer.toString(maxRetries));
-    }
+    String code = getCode(config);
+    authSession.setAuthNote(AUTH_NOTE_CODE, code);
+    authSession.setAuthNote(AUTH_NOTE_TTL, Long.toString(System.currentTimeMillis() + (ttl * 1000L)));
 
     RealmModel realm = context.getRealm();
 
